@@ -31,6 +31,7 @@ import (
 	// State Stores
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/components-contrib/state/aerospike"
+	state_dynamodb "github.com/dapr/components-contrib/state/aws/dynamodb"
 	state_azure_blobstorage "github.com/dapr/components-contrib/state/azure/blobstorage"
 	state_cosmosdb "github.com/dapr/components-contrib/state/azure/cosmosdb"
 	state_azure_tablestorage "github.com/dapr/components-contrib/state/azure/tablestorage"
@@ -42,6 +43,7 @@ import (
 	"github.com/dapr/components-contrib/state/hazelcast"
 	"github.com/dapr/components-contrib/state/memcached"
 	"github.com/dapr/components-contrib/state/mongodb"
+	state_mysql "github.com/dapr/components-contrib/state/mysql"
 	"github.com/dapr/components-contrib/state/postgresql"
 	state_redis "github.com/dapr/components-contrib/state/redis"
 	"github.com/dapr/components-contrib/state/rethinkdb"
@@ -63,13 +65,6 @@ import (
 	"github.com/dapr/components-contrib/pubsub/rabbitmq"
 	pubsub_redis "github.com/dapr/components-contrib/pubsub/redis"
 	pubsub_loader "github.com/dapr/dapr/pkg/components/pubsub"
-
-	// Exporters
-	"github.com/dapr/components-contrib/exporters"
-	"github.com/dapr/components-contrib/exporters/native"
-	"github.com/dapr/components-contrib/exporters/stringexporter"
-	"github.com/dapr/components-contrib/exporters/zipkin"
-	exporters_loader "github.com/dapr/dapr/pkg/components/exporters"
 
 	// Name resolutions
 	nr "github.com/dapr/components-contrib/nameresolution"
@@ -100,7 +95,9 @@ import (
 	"github.com/dapr/components-contrib/bindings/kafka"
 	"github.com/dapr/components-contrib/bindings/kubernetes"
 	"github.com/dapr/components-contrib/bindings/mqtt"
+	"github.com/dapr/components-contrib/bindings/mysql"
 	"github.com/dapr/components-contrib/bindings/postgres"
+	"github.com/dapr/components-contrib/bindings/postmark"
 	bindings_rabbitmq "github.com/dapr/components-contrib/bindings/rabbitmq"
 	"github.com/dapr/components-contrib/bindings/redis"
 	"github.com/dapr/components-contrib/bindings/rethinkdb/statechange"
@@ -208,6 +205,10 @@ func main() {
 			state_loader.New("rethinkdb", func() state.Store {
 				return rethinkdb.NewRethinkDBStateStore(logContrib)
 			}),
+			state_loader.New("aws.dynamodb", state_dynamodb.NewDynamoDBStateStore),
+			state_loader.New("mysql", func() state.Store {
+				return state_mysql.NewMySQLStateStore(logContrib)
+			}),
 		),
 		runtime.WithPubSubs(
 			pubsub_loader.New("redis", func() pubs.PubSub {
@@ -242,17 +243,6 @@ func main() {
 			}),
 			pubsub_loader.New("pulsar", func() pubs.PubSub {
 				return pubsub_pulsar.NewPulsar(logContrib)
-			}),
-		),
-		runtime.WithExporters(
-			exporters_loader.New("zipkin", func() exporters.Exporter {
-				return zipkin.NewZipkinExporter(logContrib)
-			}),
-			exporters_loader.New("string", func() exporters.Exporter {
-				return stringexporter.NewStringExporter(logContrib)
-			}),
-			exporters_loader.New("native", func() exporters.Exporter {
-				return native.NewNativeExporter(logContrib)
 			}),
 		),
 		runtime.WithNameResolutions(
@@ -385,6 +375,12 @@ func main() {
 			}),
 			bindings_loader.NewOutput("postgres", func() bindings.OutputBinding {
 				return postgres.NewPostgres(logContrib)
+			}),
+			bindings_loader.NewOutput("postmark", func() bindings.OutputBinding {
+				return postmark.NewPostmark(logContrib)
+			}),
+			bindings_loader.NewOutput("mysql", func() bindings.OutputBinding {
+				return mysql.NewMysql(logContrib)
 			}),
 		),
 		runtime.WithHTTPMiddleware(

@@ -93,8 +93,9 @@ func TestGetSideCarContainer(t *testing.T) {
 	annotations[daprAppPortKey] = "5000"
 	annotations[daprLogAsJSON] = "true"
 	annotations[daprAPITokenSecret] = "secret"
+	annotations[daprAppTokenSecret] = "appsecret"
 
-	container, _ := getSidecarContainer(annotations, "app_id", "darpio/dapr", "dapr-system", "controlplane:9000", "placement:50000", nil, "", "", "", "sentry:50000", true, "pod_identity")
+	container, _ := getSidecarContainer(annotations, "app_id", "darpio/dapr", "Always", "dapr-system", "controlplane:9000", "placement:50000", nil, "", "", "", "sentry:50000", true, "pod_identity")
 
 	expectedArgs := []string{
 		"--mode", "kubernetes",
@@ -111,11 +112,57 @@ func TestGetSideCarContainer(t *testing.T) {
 		"--app-max-concurrency", "-1",
 		"--sentry-address", "sentry:50000",
 		"--metrics-port", "9090",
+		"--dapr-http-max-request-size", "-1",
 		"--log-as-json",
 	}
 
+	// DAPR_HOST_IP
+	assert.Equal(t, "", container.Env[0].Value)
+	// NAMESPACE
+	assert.Equal(t, "dapr-system", container.Env[1].Value)
+	// DAPR_API_TOKEN
 	assert.Equal(t, "secret", container.Env[2].ValueFrom.SecretKeyRef.Name)
+	// DAPR_APP_TOKEN
+	assert.Equal(t, "appsecret", container.Env[3].ValueFrom.SecretKeyRef.Name)
 	assert.EqualValues(t, expectedArgs, container.Args)
+	assert.Equal(t, corev1.PullAlways, container.ImagePullPolicy)
+}
+
+func TestImagePullPolicy(t *testing.T) {
+	testCases := []struct {
+		testName       string
+		pullPolicy     string
+		expectedPolicy corev1.PullPolicy
+	}{
+		{
+			"TestDefaultPullPolicy",
+			"",
+			corev1.PullIfNotPresent,
+		},
+		{
+			"TestAlwaysPullPolicy",
+			"Always",
+			corev1.PullAlways,
+		},
+		{
+			"TestNeverPullPolicy",
+			"Never",
+			corev1.PullNever,
+		},
+		{
+			"TestIfNotPresentPullPolicy",
+			"IfNotPresent",
+			corev1.PullIfNotPresent,
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.testName, func(t *testing.T) {
+			actualPolicy := getPullPolicy(tc.pullPolicy)
+			fmt.Println(tc.testName)
+			assert.Equal(t, tc.expectedPolicy, actualPolicy)
+		})
+	}
 }
 
 func TestAddDaprEnvVarsToContainers(t *testing.T) {

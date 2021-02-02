@@ -9,6 +9,8 @@ metadata:
   name: messagebus
 spec:
   type: pubsub.redis
+  initTimeout: 1m
+  version: v1
   metadata:
   - name: redisHost
     secretKeyRef:

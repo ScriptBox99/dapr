@@ -95,7 +95,7 @@ func NewInjector(authUID string, config Config, daprClient scheme.Interface, kub
 }
 
 func ReplicasetAccountUID(kubeClient *kubernetes.Clientset) (string, error) {
-	r, err := kubeClient.CoreV1().ServiceAccounts(metav1.NamespaceSystem).Get("replicaset-controller", metav1.GetOptions{})
+	r, err := kubeClient.CoreV1().ServiceAccounts(metav1.NamespaceSystem).Get(context.TODO(), "replicaset-controller", metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
@@ -172,7 +172,7 @@ func (i *injector) handleRequest(w http.ResponseWriter, r *http.Request) {
 			err = errors.Wrapf(err, "invalid kind for review: %s", ar.Kind)
 			log.Error(err)
 		} else {
-			patchOps, err = i.getPodPatchOperations(&ar, i.config.Namespace, i.config.SidecarImage, i.kubeClient, i.daprClient)
+			patchOps, err = i.getPodPatchOperations(&ar, i.config.Namespace, i.config.SidecarImage, i.config.SidecarImagePullPolicy, i.kubeClient, i.daprClient)
 		}
 	}
 

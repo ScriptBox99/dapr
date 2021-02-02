@@ -6,6 +6,7 @@
 package injector
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -37,6 +38,7 @@ const (
 	daprEnableProfilingKey            = "dapr.io/enable-profiling"
 	daprLogLevel                      = "dapr.io/log-level"
 	daprAPITokenSecret                = "dapr.io/api-token-secret" /* #nosec */
+	daprAppTokenSecret                = "dapr.io/app-token-secret" /* #nosec */
 	daprLogAsJSON                     = "dapr.io/log-as-json"
 	daprAppMaxConcurrencyKey          = "dapr.io/app-max-concurrency"
 	daprMetricsPortKey                = "dapr.io/metrics-port"
@@ -52,6 +54,7 @@ const (
 	daprReadinessProbeTimeoutKey      = "dapr.io/sidecar-readiness-probe-timeout-seconds"
 	daprReadinessProbePeriodKey       = "dapr.io/sidecar-readiness-probe-period-seconds"
 	daprReadinessProbeThresholdKey    = "dapr.io/sidecar-readiness-probe-threshold"
+	daprMaxRequestBodySize            = "dapr.io/http-max-request-size"
 	daprAppSSLKey                     = "dapr.io/app-ssl"
 	containersPath                    = "/spec/containers"
 	sidecarHTTPPort                   = 3500
@@ -83,7 +86,7 @@ const (
 )
 
 func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
-	namespace, image string, kubeClient *kubernetes.Clientset, daprClient scheme.Interface) ([]PatchOperation, error) {
+	namespace, image, imagePullPolicy string, kubeClient *kubernetes.Clientset, daprClient scheme.Interface) ([]PatchOperation, error) {
 	req := ar.Request
 	var pod corev1.Pod
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
@@ -130,7 +133,7 @@ func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
 	}
 
 	tokenMount := getTokenVolumeMount(pod)
-	sidecarContainer, err := getSidecarContainer(pod.Annotations, id, image, req.Namespace, apiSrvAddress, placementAddress, tokenMount, trustAnchors, certChain, certKey, sentryAddress, mtlsEnabled, identity)
+	sidecarContainer, err := getSidecarContainer(pod.Annotations, id, image, imagePullPolicy, req.Namespace, apiSrvAddress, placementAddress, tokenMount, trustAnchors, certChain, certKey, sentryAddress, mtlsEnabled, identity)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +221,7 @@ LoopEnv:
 }
 
 func getTrustAnchorsAndCertChain(kubeClient *kubernetes.Clientset, namespace string) (string, string, string) {
-	secret, err := kubeClient.CoreV1().Secrets(namespace).Get(certs.KubeScrtName, meta_v1.GetOptions{})
+	secret, err := kubeClient.CoreV1().Secrets(namespace).Get(context.TODO(), certs.KubeScrtName, meta_v1.GetOptions{})
 	if err != nil {
 		return "", "", ""
 	}
@@ -306,6 +309,14 @@ func appSSLEnabled(annotations map[string]string) bool {
 
 func getAPITokenSecret(annotations map[string]string) string {
 	return getStringAnnotationOrDefault(annotations, daprAPITokenSecret, "")
+}
+
+func GetAppTokenSecret(annotations map[string]string) string {
+	return getStringAnnotationOrDefault(annotations, daprAppTokenSecret, "")
+}
+
+func getMaxRequestBodySize(annotations map[string]string) (int32, error) {
+	return getInt32Annotation(annotations, daprMaxRequestBodySize)
 }
 
 func getBoolAnnotationOrDefault(annotations map[string]string, key string, defaultValue bool) bool {
@@ -431,7 +442,20 @@ func getKubernetesDNS(name, namespace string) string {
 	return fmt.Sprintf("%s.%s.svc.cluster.local", name, namespace)
 }
 
-func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, namespace, controlPlaneAddress, placementServiceAddress string, tokenVolumeMount *corev1.VolumeMount, trustAnchors, certChain, certKey, sentryAddress string, mtlsEnabled bool, identity string) (*corev1.Container, error) {
+func getPullPolicy(pullPolicy string) corev1.PullPolicy {
+	switch pullPolicy {
+	case "Always":
+		return corev1.PullAlways
+	case "Never":
+		return corev1.PullNever
+	case "IfNotPresent":
+		return corev1.PullIfNotPresent
+	default:
+		return corev1.PullIfNotPresent
+	}
+}
+
+func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, imagePullPolicy, namespace, controlPlaneAddress, placementServiceAddress string, tokenVolumeMount *corev1.VolumeMount, trustAnchors, certChain, certKey, sentryAddress string, mtlsEnabled bool, identity string) (*corev1.Container, error) {
 	appPort, err := getAppPort(annotations)
 	if err != nil {
 		return nil, err
@@ -448,12 +472,25 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, na
 	}
 
 	sslEnabled := appSSLEnabled(annotations)
+
+	pullPolicy := getPullPolicy(imagePullPolicy)
+
 	httpHandler := getProbeHTTPHandler(sidecarHTTPPort, apiVersionV1, sidecarHealthzPath)
+
+	allowPrivilegeEscalation := false
+
+	requestBodySize, err := getMaxRequestBodySize(annotations)
+	if err != nil {
+		log.Warn(err)
+	}
 
 	c := &corev1.Container{
 		Name:            sidecarContainerName,
 		Image:           daprSidecarImage,
-		ImagePullPolicy: corev1.PullAlways,
+		ImagePullPolicy: pullPolicy,
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+		},
 		Ports: []corev1.ContainerPort{
 			{
 				ContainerPort: int32(sidecarHTTPPort),
@@ -502,6 +539,7 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, na
 			"--app-max-concurrency", fmt.Sprintf("%v", maxConcurrency),
 			"--sentry-address", sentryAddress,
 			"--metrics-port", fmt.Sprintf("%v", metricsPort),
+			"--dapr-http-max-request-size", fmt.Sprintf("%v", requestBodySize),
 		},
 		ReadinessProbe: &corev1.Probe{
 			Handler:             httpHandler,
@@ -566,6 +604,21 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, na
 					Key: "token",
 					LocalObjectReference: corev1.LocalObjectReference{
 						Name: secret,
+					},
+				},
+			},
+		})
+	}
+
+	appSecret := GetAppTokenSecret(annotations)
+	if appSecret != "" {
+		c.Env = append(c.Env, corev1.EnvVar{
+			Name: auth.AppAPITokenEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					Key: "token",
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: appSecret,
 					},
 				},
 			},

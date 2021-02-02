@@ -34,7 +34,7 @@ func TestValidationForKubernetes(t *testing.T) {
 	})
 
 	t.Run("invalid chars space", func(t *testing.T) {
-		id := "my-app-id.app"
+		id := "my-app-id app"
 		err := ValidateKubernetesAppID(id)
 		assert.Error(t, err)
 	})
@@ -42,6 +42,6 @@ func TestValidationForKubernetes(t *testing.T) {
 	t.Run("invalid empty", func(t *testing.T) {
 		id := ""
 		err := ValidateKubernetesAppID(id)
-		assert.Error(t, err)
+		assert.Regexp(t, "value for the dapr.io/app-id annotation is empty", err.Error())
 	})
 }

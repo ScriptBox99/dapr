@@ -47,7 +47,7 @@ func TestLoadStandaloneConfiguration(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			config, err := LoadStandaloneConfiguration(tc.path)
+			config, _, err := LoadStandaloneConfiguration(tc.path)
 			if tc.errorExpected {
 				assert.Error(t, err, "Expected an error")
 				assert.Nil(t, config, "Config should not be loaded")
@@ -57,6 +57,16 @@ func TestLoadStandaloneConfiguration(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadStandaloneConfigurationKindName(t *testing.T) {
+	t.Run("test Kind and Name", func(t *testing.T) {
+		config, _, err := LoadStandaloneConfiguration("./testdata/config.yaml")
+		assert.NoError(t, err, "Unexpected error")
+		assert.NotNil(t, config, "Config not loaded as expected")
+		assert.Equal(t, "secretappconfig", config.ObjectMeta.Name)
+		assert.Equal(t, "Configuration", config.TypeMeta.Kind)
+	})
 }
 
 func TestMetricSpecForStandAlone(t *testing.T) {
@@ -79,7 +89,7 @@ func TestMetricSpecForStandAlone(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			config, err := LoadStandaloneConfiguration(tc.confFile)
+			config, _, err := LoadStandaloneConfiguration(tc.confFile)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.metricEnabled, config.Spec.MetricSpec.Enabled)
 		})
@@ -794,9 +804,22 @@ func TestIsOperationAllowedByAccessControlPolicy(t *testing.T) {
 			Namespace:   "ns2",
 			AppID:       srcAppID,
 		}
-		isAllowed, _ := IsOperationAllowedByAccessControlPolicy(&spiffeID, srcAppID, "/op3/a/b", common.HTTPExtension_PUT, HTTPProtocol, accessControlList)
+		isAllowed, _ := IsOperationAllowedByAccessControlPolicy(&spiffeID, srcAppID, "/op3/b/b", common.HTTPExtension_PUT, HTTPProtocol, accessControlList)
 		// Action = Default action for the app
 		assert.False(t, isAllowed)
+	})
+
+	t.Run("test when non-matching operation post fix is specified in policy spec", func(t *testing.T) {
+		srcAppID := app2
+		accessControlList, _ := initializeAccessControlList()
+		spiffeID := SpiffeID{
+			TrustDomain: "domain1",
+			Namespace:   "ns2",
+			AppID:       srcAppID,
+		}
+		isAllowed, _ := IsOperationAllowedByAccessControlPolicy(&spiffeID, srcAppID, "/op3/a/b", common.HTTPExtension_PUT, HTTPProtocol, accessControlList)
+		// Action = Default action for the app
+		assert.True(t, isAllowed)
 	})
 
 	t.Run("test with grpc invocation", func(t *testing.T) {
@@ -833,5 +856,12 @@ func TestGetOperationPrefixAndPostfix(t *testing.T) {
 		prefix, postfix := getOperationPrefixAndPostfix(operation)
 		assert.Equal(t, "/invoke", prefix)
 		assert.Equal(t, "/", postfix)
+	})
+
+	t.Run("test operation multi path post fix exists", func(t *testing.T) {
+		operation := "/invoke/a/b/*"
+		prefix, postfix := getOperationPrefixAndPostfix(operation)
+		assert.Equal(t, "/invoke", prefix)
+		assert.Equal(t, "/a/b/*", postfix)
 	})
 }
