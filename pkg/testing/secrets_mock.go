@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -38,5 +38,9 @@ func (c FakeSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (s
 }
 
 func (c FakeSecretStore) Init(metadata secretstores.Metadata) error {
+	return nil
+}
+
+func (c FakeSecretStore) Close() error {
 	return nil
 }

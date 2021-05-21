@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -21,7 +21,7 @@ const (
 )
 
 func TestConfigCorrectValues(t *testing.T) {
-	i := NewInjector("", Config{
+	i := NewInjector(nil, Config{
 		TLSCertFile:            "a",
 		TLSKeyFile:             "b",
 		SidecarImage:           "c",

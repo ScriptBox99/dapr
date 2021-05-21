@@ -1,5 +1,5 @@
 # ------------------------------------------------------------
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) Microsoft Corporation and Dapr Contributors.
 # Licensed under the MIT License.
 # ------------------------------------------------------------
 
@@ -62,6 +62,7 @@ export GOOS ?= $(TARGET_OS_LOCAL)
 # Default docker container and e2e test targst.
 TARGET_OS ?= linux
 TARGET_ARCH ?= amd64
+TEST_OUTPUT_FILE_PREFIX ?= ./test_report
 
 ifeq ($(GOOS),windows)
 BINARY_EXT_LOCAL:=.exe
@@ -205,7 +206,7 @@ docker-deploy-k8s: check-docker-env check-arch
 		--set global.ha.enabled=$(HA_MODE) --set-string global.tag=$(DAPR_TAG)-$(TARGET_OS)-$(TARGET_ARCH) \
 		--set-string global.registry=$(DAPR_REGISTRY) --set global.logAsJson=true \
 		--set global.daprControlPlaneOs=$(TARGET_OS) --set global.daprControlPlaneArch=$(TARGET_ARCH) \
-		--set dapr_placement.logLevel=debug \
+		--set dapr_placement.logLevel=debug --set dapr_sidecar_injector.sidecarImagePullPolicy=Always \
 		--set dapr_placement.cluster.forceInMemoryLog=$(FORCE_INMEM) $(HELM_CHART_DIR)
 
 ################################################################################
@@ -217,8 +218,8 @@ release: build archive
 # Target: test                                                                 #
 ################################################################################
 .PHONY: test
-test:
-	go test ./pkg/... $(COVERAGE_OPTS)
+test: test-deps
+	gotestsum --jsonfile $(TEST_OUTPUT_FILE_PREFIX)_unit.json --format standard-quiet -- ./pkg/... $(COVERAGE_OPTS)
 	go test ./tests/...
 
 ################################################################################
@@ -262,7 +263,7 @@ $(foreach ITEM,$(GRPC_PROTOS),$(eval $(call genProtoc,$(ITEM))))
 GEN_PROTOS:=$(foreach ITEM,$(GRPC_PROTOS),gen-proto-$(ITEM))
 
 .PHONY: gen-proto
-gen-proto: $(GEN_PROTOS) modtidy
+gen-proto: check-proto-version $(GEN_PROTOS) modtidy
 
 ################################################################################
 # Target: get-components-contrib                                               #
@@ -278,6 +279,36 @@ get-components-contrib:
 check-diff:
 	git diff --exit-code ./go.mod # check no changes
 	git diff --exit-code ./go.sum # check no changes
+
+################################################################################
+# Target: check-proto-version                                                         #
+################################################################################
+.PHONY: check-proto-version
+check-proto-version: ## Checking the version of proto related tools
+	@test "$(shell protoc --version)" = "libprotoc 3.14.0" \
+	|| { echo "please use protoc 3.14.0 to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
+
+	@test "$(shell protoc-gen-go-grpc --version)" = "protoc-gen-go-grpc 1.1.0" \
+	|| { echo "please use protoc-gen-go-grpc 1.1.0 to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
+
+	@test "$(shell protoc-gen-go --version 2>&1)" = "protoc-gen-go v1.25.0" \
+	|| { echo "please use protoc-gen-go v1.25.0 to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
+
+################################################################################
+# Target: check-proto-diff                                                           #
+################################################################################
+.PHONY: check-proto-diff
+check-proto-diff:
+	git diff --exit-code ./pkg/proto/common/v1/common.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/internals/v1/status.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/operator/v1/operator.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/operator/v1/operator_grpc.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/runtime/v1/appcallback.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/runtime/v1/appcallback_grpc.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/runtime/v1/dapr.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/runtime/v1/dapr_grpc.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/sentry/v1/sentry.pb.go # check no changes
+
 
 ################################################################################
 # Target: codegen                                                              #

@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -149,4 +149,28 @@ func TestProto(t *testing.T) {
 
 	assert.Equal(t, "application/json", req2.GetMessage().ContentType)
 	assert.Equal(t, []byte("test"), req2.GetMessage().Data.Value)
+}
+
+func TestAddHeaders(t *testing.T) {
+	req := NewInvokeMethodRequest("test_method")
+	header := fasthttp.RequestHeader{}
+	header.Add("Dapr-Reentrant-Id", "test")
+	req.AddHeaders(&header)
+
+	assert.NotNil(t, req.r.Metadata)
+	assert.NotNil(t, req.r.Metadata["Dapr-Reentrant-Id"])
+	assert.Equal(t, "test", req.r.Metadata["Dapr-Reentrant-Id"].Values[0])
+}
+
+func TestAddHeadersDoesNotOverwrite(t *testing.T) {
+	header := fasthttp.RequestHeader{}
+	header.Add("Dapr-Reentrant-Id", "test")
+	req := NewInvokeMethodRequest("test_method").WithFastHTTPHeaders(&header)
+
+	header.Set("Dapr-Reentrant-Id", "test2")
+	req.AddHeaders(&header)
+
+	assert.NotNil(t, req.r.Metadata)
+	assert.NotNil(t, req.r.Metadata["Dapr-Reentrant-Id"])
+	assert.Equal(t, "test", req.r.Metadata["Dapr-Reentrant-Id"].Values[0])
 }

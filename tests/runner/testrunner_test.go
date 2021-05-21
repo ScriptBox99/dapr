@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -94,6 +94,7 @@ func TestStartRunner(t *testing.T) {
 			RegistryName:   "fakeregistry",
 			Replicas:       1,
 			IngressEnabled: true,
+			MetricsEnabled: true,
 		},
 		{
 			AppName:        "fakeapp1",
@@ -102,6 +103,7 @@ func TestStartRunner(t *testing.T) {
 			RegistryName:   "fakeregistry",
 			Replicas:       1,
 			IngressEnabled: true,
+			MetricsEnabled: true,
 		},
 	}
 

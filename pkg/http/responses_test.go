@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -8,6 +8,7 @@ package http
 import (
 	"testing"
 
+	"github.com/agrea/ptr"
 	"github.com/stretchr/testify/assert"
 	"github.com/valyala/fasthttp"
 )
@@ -31,7 +32,7 @@ func TestHeaders(t *testing.T) {
 	t.Run("Respond with ETag JSON", func(t *testing.T) {
 		ctx := &fasthttp.RequestCtx{Request: fasthttp.Request{}}
 		etagValue := "etagValue"
-		respondWithETaggedJSON(ctx, 200, nil, etagValue)
+		respondWithETaggedJSON(ctx, 200, nil, ptr.String(etagValue))
 
 		assert.Equal(t, etagValue, string(ctx.Response.Header.Peek(etagHeader)))
 	})

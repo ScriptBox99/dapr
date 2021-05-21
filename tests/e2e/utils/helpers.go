@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -81,7 +81,8 @@ func newHTTPClient() http.Client {
 			Transport: &http.Transport{
 				// Sometimes, the first connection to ingress endpoint takes longer than 1 minute (e.g. AKS)
 				Dial: (&net.Dialer{
-					Timeout: 5 * time.Minute,
+					Timeout:   5 * time.Minute,
+					KeepAlive: 6 * time.Minute,
 				}).Dial,
 			},
 		}

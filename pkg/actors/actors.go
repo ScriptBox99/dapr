@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -14,26 +14,29 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+	"github.com/google/uuid"
+	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
+	"github.com/valyala/fasthttp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/dapr/pkg/actors/internal"
 	"github.com/dapr/dapr/pkg/channel"
-	"github.com/dapr/dapr/pkg/config"
+	configuration "github.com/dapr/dapr/pkg/config"
 	dapr_credentials "github.com/dapr/dapr/pkg/credentials"
 	diag "github.com/dapr/dapr/pkg/diagnostics"
 	diag_utils "github.com/dapr/dapr/pkg/diagnostics/utils"
 	"github.com/dapr/dapr/pkg/health"
-	"github.com/dapr/dapr/pkg/logger"
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	"github.com/dapr/dapr/pkg/modes"
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
 	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
 	"github.com/dapr/dapr/pkg/retry"
-	"github.com/mitchellh/mapstructure"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"github.com/dapr/kit/logger"
 )
 
 const (
@@ -62,6 +65,7 @@ type Actors interface {
 type actorsRuntime struct {
 	appChannel          channel.AppChannel
 	store               state.Store
+	transactionalStore  state.TransactionalStore
 	placement           *internal.ActorPlacement
 	grpcConnectionFn    func(address, id string, namespace string, skipTLS, recreateIfExists, enableSSL bool) (*grpc.ClientConn, error)
 	config              Config
@@ -77,7 +81,8 @@ type actorsRuntime struct {
 	evaluationChan      chan bool
 	appHealthy          bool
 	certChain           *dapr_credentials.CertChain
-	tracingSpec         config.TracingSpec
+	tracingSpec         configuration.TracingSpec
+	reentrancyEnabled   bool
 }
 
 // ActiveActorsCount contain actorType and count of actors each type has
@@ -97,11 +102,21 @@ func NewActors(
 	grpcConnectionFn func(address, id string, namespace string, skipTLS, recreateIfExists, enableSSL bool) (*grpc.ClientConn, error),
 	config Config,
 	certChain *dapr_credentials.CertChain,
-	tracingSpec config.TracingSpec) Actors {
+	tracingSpec configuration.TracingSpec,
+	features []configuration.FeatureSpec) Actors {
+	var transactionalStore state.TransactionalStore
+	if stateStore != nil {
+		features := stateStore.Features()
+		if state.FeatureETag.IsPresent(features) && state.FeatureTransactional.IsPresent(features) {
+			transactionalStore = stateStore.(state.TransactionalStore)
+		}
+	}
+
 	return &actorsRuntime{
 		appChannel:          appChannel,
 		config:              config,
 		store:               stateStore,
+		transactionalStore:  transactionalStore,
 		grpcConnectionFn:    grpcConnectionFn,
 		actorsTable:         &sync.Map{},
 		activeTimers:        &sync.Map{},
@@ -116,6 +131,7 @@ func NewActors(
 		appHealthy:          true,
 		certChain:           certChain,
 		tracingSpec:         tracingSpec,
+		reentrancyEnabled:   configuration.IsFeatureEnabled(features, configuration.ActorRentrancy) && config.Reentrancy.Enabled,
 	}
 }
 
@@ -127,11 +143,11 @@ func (a *actorsRuntime) Init() error {
 	if len(a.config.HostedActorTypes) > 0 {
 		if a.store == nil {
 			log.Warn("actors: state store must be present to initialize the actor runtime")
-		}
-
-		_, ok := a.store.(state.TransactionalStore)
-		if !ok {
-			return errors.New(incompatibleStateStore)
+		} else {
+			features := a.store.Features()
+			if !state.FeatureETag.IsPresent(features) || !state.FeatureTransactional.IsPresent(features) {
+				return errors.New(incompatibleStateStore)
+			}
 		}
 	}
 
@@ -157,7 +173,7 @@ func (a *actorsRuntime) Init() error {
 
 	// Be careful to configure healthz endpoint option. If app healthz returns unhealthy status, Dapr will
 	// disconnect from placement to remove the node from consistent hashing ring.
-	// i.e if app is busy state, the heathz status would be flaky, which leads to frequent
+	// i.e if app is busy state, the healthz status would be flaky, which leads to frequent
 	// actor rebalancing. It will impact the entire service.
 	go a.startAppHealthCheck(
 		health.WithFailureThreshold(4),
@@ -236,7 +252,7 @@ func (a *actorsRuntime) startDeactivationTicker(interval, actorIdleTimeout time.
 						actorType, actorID := a.getActorTypeAndIDFromKey(actorKey)
 						err := a.deactivateActor(actorType, actorID)
 						if err != nil {
-							log.Warnf("failed to deactivate actor %s: %s", actorKey, err)
+							log.Errorf("failed to deactivate actor %s: %s", actorKey, err)
 						}
 					}(key.(string))
 				}
@@ -306,7 +322,7 @@ func (a *actorsRuntime) getOrCreateActor(actorType, actorID string) *actor {
 	// call newActor, but this is trivial.
 	val, ok := a.actorsTable.Load(key)
 	if !ok {
-		val, _ = a.actorsTable.LoadOrStore(key, newActor(actorType, actorID))
+		val, _ = a.actorsTable.LoadOrStore(key, newActor(actorType, actorID, a.config.Reentrancy.MaxStackDepth))
 	}
 
 	return val.(*actor)
@@ -316,7 +332,20 @@ func (a *actorsRuntime) callLocalActor(ctx context.Context, req *invokev1.Invoke
 	actorTypeID := req.Actor()
 
 	act := a.getOrCreateActor(actorTypeID.GetActorType(), actorTypeID.GetActorId())
-	err := act.lock()
+
+	// Reentrancy to determine how we lock.
+	var reentrancyID *string
+	if headerValue, ok := req.Metadata()["Dapr-Reentrancy-Id"]; a.reentrancyEnabled && ok {
+		reentrancyID = &headerValue.GetValues()[0]
+	} else {
+		reentrancyHeader := fasthttp.RequestHeader{}
+		uuid := uuid.New().String()
+		reentrancyHeader.Add("Dapr-Reentrancy-Id", uuid)
+		req.AddHeaders(&reentrancyHeader)
+		reentrancyID = &uuid
+	}
+
+	err := act.lock(reentrancyID)
 	if err != nil {
 		return nil, status.Error(codes.ResourceExhausted, err.Error())
 	}
@@ -348,6 +377,8 @@ func (a *actorsRuntime) callRemoteActor(
 	ctx context.Context,
 	targetAddress, targetID string,
 	req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error) {
+	log.Infof("Entering callRemoteActor: %s - %s", req.Actor().GetActorType(), req.Actor().GetActorId())
+	log.Infof("callRemoteActor Request Headers: %v", req.Metadata())
 	conn, err := a.grpcConnectionFn(targetAddress, targetID, a.config.Namespace, false, false, false)
 	if err != nil {
 		return nil, err
@@ -392,7 +423,7 @@ func (a *actorsRuntime) GetState(ctx context.Context, req *GetStateRequest) (*St
 }
 
 func (a *actorsRuntime) TransactionalStateOperation(ctx context.Context, req *TransactionalRequest) error {
-	if a.store == nil {
+	if a.store == nil || a.transactionalStore == nil {
 		return errors.New("actors: state store does not exist or incorrectly configured")
 	}
 	operations := []state.TransactionalStateOperation{}
@@ -436,12 +467,7 @@ func (a *actorsRuntime) TransactionalStateOperation(ctx context.Context, req *Tr
 		}
 	}
 
-	transactionalStore, ok := a.store.(state.TransactionalStore)
-	if !ok {
-		return errors.New(incompatibleStateStore)
-	}
-
-	err := transactionalStore.Multi(&state.TransactionalStateRequest{
+	err := a.transactionalStore.Multi(&state.TransactionalStateRequest{
 		Operations: operations,
 		Metadata:   metadata,
 	})
@@ -509,7 +535,7 @@ func (a *actorsRuntime) drainRebalancedActors() {
 					if !actor.isBusy() {
 						err := a.deactivateActor(actorType, actorID)
 						if err != nil {
-							log.Warnf("failed to deactivate actor %s: %s", actorKey, err)
+							log.Errorf("failed to deactivate actor %s: %s", actorKey, err)
 						}
 						break
 					}
@@ -530,9 +556,9 @@ func (a *actorsRuntime) evaluateReminders() {
 
 	var wg sync.WaitGroup
 	for _, t := range a.config.HostedActorTypes {
-		vals, err := a.getRemindersForActorType(t)
+		vals, _, err := a.getRemindersForActorType(t)
 		if err != nil {
-			log.Debugf("error getting reminders for actor type %s: %s", t, err)
+			log.Errorf("error getting reminders for actor type %s: %s", t, err)
 		} else {
 			a.remindersLock.Lock()
 			a.reminders[t] = vals
@@ -559,7 +585,7 @@ func (a *actorsRuntime) evaluateReminders() {
 							a.activeReminders.Store(reminderKey, stop)
 							err := a.startReminder(&r, stop)
 							if err != nil {
-								log.Debugf("error starting reminder: %s", err)
+								log.Errorf("error starting reminder: %s", err)
 							}
 						}
 					}
@@ -684,7 +710,7 @@ func (a *actorsRuntime) startReminder(reminder *Reminder, stopChannel chan bool)
 					case <-ticker.C:
 						err := a.executeReminder(actorType, actorID, dueTime, period, reminder, data)
 						if err != nil {
-							log.Debugf("error invoking reminder on actor %s: %s", a.constructCompositeKey(actorType, actorID), err)
+							log.Errorf("error invoking reminder on actor %s: %s", a.constructCompositeKey(actorType, actorID), err)
 						}
 					case <-stop:
 						log.Infof("reminder: %v with parameters: dueTime: %v, period: %v, data: %v has been deleted.", reminderKey, dueTime, period, data)
@@ -728,7 +754,7 @@ func (a *actorsRuntime) executeReminder(actorType, actorID, dueTime, period, rem
 		key := a.constructCompositeKey(actorType, actorID)
 		err = a.updateReminderTrack(key, reminder)
 	} else {
-		log.Debugf("error execution of reminder %s for actor type %s with id %s: %s", reminder, actorType, actorID, err)
+		log.Errorf("error execution of reminder %s for actor type %s with id %s: %s", reminder, actorType, actorID, err)
 	}
 	return err
 }
@@ -800,24 +826,31 @@ func (a *actorsRuntime) CreateReminder(ctx context.Context, req *CreateReminderR
 		RegisteredTime: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	reminders, err := a.getRemindersForActorType(req.ActorType)
+	err := backoff.Retry(func() error {
+		reminders, remindersEtag, err := a.getRemindersForActorType(req.ActorType)
+		if err != nil {
+			return err
+		}
+
+		reminders = append(reminders, reminder)
+
+		err = a.store.Set(&state.SetRequest{
+			Key:   a.constructCompositeKey("actors", req.ActorType),
+			Value: reminders,
+			ETag:  remindersEtag,
+		})
+		if err != nil {
+			return err
+		}
+
+		a.remindersLock.Lock()
+		a.reminders[req.ActorType] = reminders
+		a.remindersLock.Unlock()
+		return nil
+	}, backoff.NewExponentialBackOff())
 	if err != nil {
 		return err
 	}
-
-	reminders = append(reminders, reminder)
-
-	err = a.store.Set(&state.SetRequest{
-		Key:   a.constructCompositeKey("actors", req.ActorType),
-		Value: reminders,
-	})
-	if err != nil {
-		return err
-	}
-
-	a.remindersLock.Lock()
-	a.reminders[req.ActorType] = reminders
-	a.remindersLock.Unlock()
 
 	err = a.startReminder(&reminder, stop)
 	if err != nil {
@@ -874,7 +907,7 @@ func (a *actorsRuntime) CreateTimer(ctx context.Context, req *CreateTimerRequest
 		err := a.executeTimer(req.ActorType, req.ActorID, req.Name, req.DueTime,
 			req.Period, req.Callback, req.Data)
 		if err != nil {
-			log.Debugf("error invoking timer on actor %s: %s", actorKey, err)
+			log.Errorf("error invoking timer on actor %s: %s", actorKey, err)
 		}
 
 		ticker := a.configureTicker(period)
@@ -888,7 +921,7 @@ func (a *actorsRuntime) CreateTimer(ctx context.Context, req *CreateTimerRequest
 					err := a.executeTimer(req.ActorType, req.ActorID, req.Name, req.DueTime,
 						req.Period, req.Callback, req.Data)
 					if err != nil {
-						log.Debugf("error invoking timer on actor %s: %s", actorKey, err)
+						log.Errorf("error invoking timer on actor %s: %s", actorKey, err)
 					}
 				} else {
 					a.DeleteTimer(ctx, &DeleteTimerRequest{
@@ -934,23 +967,24 @@ func (a *actorsRuntime) executeTimer(actorType, actorID, name, dueTime, period, 
 	req.WithRawData(b, invokev1.JSONContentType)
 	_, err = a.callLocalActor(context.Background(), req)
 	if err != nil {
-		log.Debugf("error execution of timer %s for actor type %s with id %s: %s", name, actorType, actorID, err)
+		log.Errorf("error execution of timer %s for actor type %s with id %s: %s", name, actorType, actorID, err)
 	}
 	return err
 }
 
-func (a *actorsRuntime) getRemindersForActorType(actorType string) ([]Reminder, error) {
+func (a *actorsRuntime) getRemindersForActorType(actorType string) ([]Reminder, *string, error) {
 	key := a.constructCompositeKey("actors", actorType)
 	resp, err := a.store.Get(&state.GetRequest{
 		Key: key,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var reminders []Reminder
 	json.Unmarshal(resp.Data, &reminders)
-	return reminders, nil
+
+	return reminders, resp.ETag, nil
 }
 
 func (a *actorsRuntime) DeleteReminder(ctx context.Context, req *DeleteReminderRequest) error {
@@ -974,28 +1008,35 @@ func (a *actorsRuntime) DeleteReminder(ctx context.Context, req *DeleteReminderR
 		a.activeReminders.Delete(reminderKey)
 	}
 
-	reminders, err := a.getRemindersForActorType(req.ActorType)
-	if err != nil {
-		return err
-	}
-
-	for i := len(reminders) - 1; i >= 0; i-- {
-		if reminders[i].ActorType == req.ActorType && reminders[i].ActorID == req.ActorID && reminders[i].Name == req.Name {
-			reminders = append(reminders[:i], reminders[i+1:]...)
+	err := backoff.Retry(func() error {
+		reminders, remindersEtag, err := a.getRemindersForActorType(req.ActorType)
+		if err != nil {
+			return err
 		}
-	}
 
-	err = a.store.Set(&state.SetRequest{
-		Key:   key,
-		Value: reminders,
-	})
+		for i := len(reminders) - 1; i >= 0; i-- {
+			if reminders[i].ActorType == req.ActorType && reminders[i].ActorID == req.ActorID && reminders[i].Name == req.Name {
+				reminders = append(reminders[:i], reminders[i+1:]...)
+			}
+		}
+
+		err = a.store.Set(&state.SetRequest{
+			Key:   key,
+			Value: reminders,
+			ETag:  remindersEtag,
+		})
+		if err != nil {
+			return err
+		}
+
+		a.remindersLock.Lock()
+		a.reminders[req.ActorType] = reminders
+		a.remindersLock.Unlock()
+		return nil
+	}, backoff.NewExponentialBackOff())
 	if err != nil {
 		return err
 	}
-
-	a.remindersLock.Lock()
-	a.reminders[req.ActorType] = reminders
-	a.remindersLock.Unlock()
 
 	err = a.store.Delete(&state.DeleteRequest{
 		Key: reminderKey,
@@ -1008,7 +1049,7 @@ func (a *actorsRuntime) DeleteReminder(ctx context.Context, req *DeleteReminderR
 }
 
 func (a *actorsRuntime) GetReminder(ctx context.Context, req *GetReminderRequest) (*Reminder, error) {
-	reminders, err := a.getRemindersForActorType(req.ActorType)
+	reminders, _, err := a.getRemindersForActorType(req.ActorType)
 	if err != nil {
 		return nil, err
 	}
@@ -1049,7 +1090,7 @@ func (a *actorsRuntime) GetActiveActorsCount(ctx context.Context) []ActiveActors
 		return true
 	})
 
-	activeActorsCount := []ActiveActorsCount{}
+	activeActorsCount := make([]ActiveActorsCount, 0, len(actorCountMap))
 	for actorType, count := range actorCountMap {
 		activeActorsCount = append(activeActorsCount, ActiveActorsCount{Type: actorType, Count: count})
 	}

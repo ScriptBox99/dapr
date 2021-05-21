@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -47,6 +47,11 @@ func CreateLocalChannel(port, maxConcurrency int, conn *grpc.ClientConn, spec co
 // GetBaseAddress returns the application base address
 func (g *Channel) GetBaseAddress() string {
 	return g.baseAddress
+}
+
+// GetAppConfig gets application config from user application
+func (g *Channel) GetAppConfig() (*config.ApplicationConfig, error) {
+	return nil, nil
 }
 
 // InvokeMethod invokes user code via gRPC

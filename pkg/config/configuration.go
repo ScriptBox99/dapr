@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -16,9 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dapr/dapr/pkg/logger"
-	"github.com/dapr/dapr/pkg/proto/common/v1"
-	operatorv1pb "github.com/dapr/dapr/pkg/proto/operator/v1"
 	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc/credentials"
@@ -26,23 +23,30 @@ import (
 	yaml "gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	"github.com/dapr/dapr/pkg/proto/common/v1"
+	operatorv1pb "github.com/dapr/dapr/pkg/proto/operator/v1"
+	"github.com/dapr/kit/logger"
 )
 
 var log = logger.NewLogger("dapr.configuration")
 
 const (
-	operatorCallTimeout = time.Second * 5
-	operatorMaxRetries  = 100
-	AllowAccess         = "allow"
-	DenyAccess          = "deny"
-	DefaultTrustDomain  = "public"
-	DefaultNamespace    = "default"
-	ActionPolicyApp     = "app"
-	ActionPolicyGlobal  = "global"
-	SpiffeIDPrefix      = "spiffe://"
-	HTTPProtocol        = "http"
-	GRPCProtocol        = "grpc"
+	operatorCallTimeout         = time.Second * 5
+	operatorMaxRetries          = 100
+	AllowAccess                 = "allow"
+	DenyAccess                  = "deny"
+	DefaultTrustDomain          = "public"
+	DefaultNamespace            = "default"
+	ActionPolicyApp             = "app"
+	ActionPolicyGlobal          = "global"
+	SpiffeIDPrefix              = "spiffe://"
+	HTTPProtocol                = "http"
+	GRPCProtocol                = "grpc"
+	ActorRentrancy      Feature = "Actor.Reentrancy"
 )
+
+type Feature string
 
 // Configuration is an internal (and duplicate) representation of Dapr's Configuration CRD.
 type Configuration struct {
@@ -77,12 +81,15 @@ type AccessControlListOperationAction struct {
 }
 
 type ConfigurationSpec struct {
-	HTTPPipelineSpec  PipelineSpec      `json:"httpPipeline,omitempty" yaml:"httpPipeline,omitempty"`
-	TracingSpec       TracingSpec       `json:"tracing,omitempty" yaml:"tracing,omitempty"`
-	MTLSSpec          MTLSSpec          `json:"mtls,omitempty"`
-	MetricSpec        MetricSpec        `json:"metric,omitempty" yaml:"metric,omitempty"`
-	Secrets           SecretsSpec       `json:"secrets,omitempty" yaml:"secrets,omitempty"`
-	AccessControlSpec AccessControlSpec `json:"accessControl,omitempty" yaml:"accessControl,omitempty"`
+	HTTPPipelineSpec   PipelineSpec       `json:"httpPipeline,omitempty" yaml:"httpPipeline,omitempty"`
+	TracingSpec        TracingSpec        `json:"tracing,omitempty" yaml:"tracing,omitempty"`
+	MTLSSpec           MTLSSpec           `json:"mtls,omitempty"`
+	MetricSpec         MetricSpec         `json:"metric,omitempty" yaml:"metric,omitempty"`
+	Secrets            SecretsSpec        `json:"secrets,omitempty" yaml:"secrets,omitempty"`
+	AccessControlSpec  AccessControlSpec  `json:"accessControl,omitempty" yaml:"accessControl,omitempty"`
+	NameResolutionSpec NameResolutionSpec `json:"nameResolution,omitempty" yaml:"nameResolution,omitempty"`
+	Features           []FeatureSpec      `json:"features,omitempty" yaml:"features,omitempty"`
+	APISpec            APISpec            `json:"api,omitempty" yaml:"api,omitempty"`
 }
 
 type SecretsSpec struct {
@@ -101,9 +108,22 @@ type PipelineSpec struct {
 	Handlers []HandlerSpec `json:"handlers" yaml:"handlers"`
 }
 
+// APISpec describes the configuration for Dapr APIs
+type APISpec struct {
+	Allowed []APIAccessRule `json:"allowed,omitempty"`
+}
+
+// APIAccessRule describes an access rule for allowing a Dapr API to be enabled and accessible by an app
+type APIAccessRule struct {
+	Name     string `json:"name"`
+	Version  string `json:"version"`
+	Protocol string `json:"protocol"`
+}
+
 type HandlerSpec struct {
 	Name         string       `json:"name" yaml:"name"`
 	Type         string       `json:"type" yaml:"type"`
+	Version      string       `json:"version" yaml:"version"`
 	SelectorSpec SelectorSpec `json:"selector,omitempty" yaml:"selector,omitempty"`
 }
 
@@ -155,6 +175,12 @@ type AccessControlSpec struct {
 	AppPolicies   []AppPolicySpec `json:"policies" yaml:"policies"`
 }
 
+type NameResolutionSpec struct {
+	Component     string      `json:"component" yaml:"component"`
+	Version       string      `json:"version" yaml:"version"`
+	Configuration interface{} `json:"configuration" yaml:"configuration"`
+}
+
 type MTLSSpec struct {
 	Enabled          bool   `json:"enabled"`
 	WorkloadCertTTL  string `json:"workloadCertTTL"`
@@ -166,6 +192,12 @@ type SpiffeID struct {
 	TrustDomain string
 	Namespace   string
 	AppID       string
+}
+
+// FeatureSpec defines which preview features are enabled
+type FeatureSpec struct {
+	Name    Feature `json:"name" yaml:"name"`
+	Enabled bool    `json:"enabled" yaml:"enabled"`
 }
 
 // LoadDefaultConfiguration returns the default config
@@ -197,6 +229,9 @@ func LoadStandaloneConfiguration(config string) (*Configuration, string, error) 
 	if err != nil {
 		return nil, "", err
 	}
+
+	// Parse environment variables from yaml
+	b = []byte(os.ExpandEnv(string(b)))
 
 	conf := LoadDefaultConfiguration()
 	err = yaml.Unmarshal(b, conf)
@@ -293,7 +328,7 @@ func containsKey(s []string, key string) bool {
 }
 
 // ParseAccessControlSpec creates an in-memory copy of the Access Control Spec for fast lookup
-func ParseAccessControlSpec(accessControlSpec AccessControlSpec) (*AccessControlList, error) {
+func ParseAccessControlSpec(accessControlSpec AccessControlSpec, protocol string) (*AccessControlList, error) {
 	if accessControlSpec.TrustDomain == "" &&
 		accessControlSpec.DefaultAction == "" &&
 		(accessControlSpec.AppPolicies == nil || len(accessControlSpec.AppPolicies) == 0) {
@@ -358,6 +393,11 @@ func ParseAccessControlSpec(accessControlSpec AccessControlSpec) (*AccessControl
 				operation = "/" + operation
 			}
 			operationPrefix, operationPostfix := getOperationPrefixAndPostfix(operation)
+
+			if protocol == HTTPProtocol {
+				operationPrefix = strings.ToLower(operationPrefix)
+				operationPostfix = strings.ToLower(operationPostfix)
+			}
 
 			operationActions := AccessControlListOperationAction{
 				OperationPostFix: operationPostfix,
@@ -538,11 +578,18 @@ func IsOperationAllowedByAccessControlPolicy(spiffeID *SpiffeID, srcAppID string
 
 	inputOperationPrefix, inputOperationPostfix := getOperationPrefixAndPostfix(inputOperation)
 
+	// If HTTP, make case-insensitive
+	if appProtocol == HTTPProtocol {
+		inputOperationPrefix = strings.ToLower(inputOperationPrefix)
+		inputOperationPostfix = strings.ToLower(inputOperationPostfix)
+	}
+
 	// The acl may specify the operation in a format /invoke/*, get and match only the prefix first
 	operationPolicy, found := appPolicy.AppOperationActions[inputOperationPrefix]
 	if found {
 		// The ACL might have the operation specified as /invoke/*. Here "/*" is stored as the postfix.
 		// Match postfix
+
 		if strings.Contains(operationPolicy.OperationPostFix, "/*") {
 			if !strings.HasPrefix(inputOperationPostfix, strings.ReplaceAll(operationPolicy.OperationPostFix, "/*", "")) {
 				return isActionAllowed(action), actionPolicy
@@ -598,4 +645,13 @@ func getOperationPrefixAndPostfix(operation string) (string, string) {
 	operationPostfix := "/" + strings.Join(operationParts[2:], "/")
 
 	return operationPrefix, operationPostfix
+}
+
+func IsFeatureEnabled(features []FeatureSpec, target Feature) bool {
+	for _, feature := range features {
+		if feature.Name == target {
+			return feature.Enabled
+		}
+	}
+	return false
 }

@@ -1,5 +1,5 @@
 // ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation and Dapr Contributors.
 // Licensed under the MIT License.
 // ------------------------------------------------------------
 
@@ -55,6 +55,15 @@ func TestGetGRPCConnection(t *testing.T) {
 		assert.NoError(t, err2)
 		assert.Equal(t, connectivity.Shutdown, conn.GetState())
 		conn2.Close()
+	})
+
+	t.Run("Connection with SSL is created successfully", func(t *testing.T) {
+		m := NewGRPCManager(modes.StandaloneMode)
+		assert.NotNil(t, m)
+		port := 55555
+		sslEnabled := true
+		_, err := m.GetGRPCConnection(fmt.Sprintf("127.0.0.1:%v", port), "", "", true, true, sslEnabled)
+		assert.NoError(t, err)
 	})
 }
 
