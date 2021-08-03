@@ -7,10 +7,9 @@ package runner
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
-
-	"log"
 
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 )
@@ -259,6 +258,20 @@ func (c *KubeTestPlatform) Scale(name string, replicas int32) error {
 	appManager := app.(*kube.AppManager)
 
 	if err := appManager.ScaleDeploymentReplica(replicas); err != nil {
+		return err
+	}
+
+	_, err := appManager.WaitUntilDeploymentState(appManager.IsDeploymentDone)
+
+	return err
+}
+
+// SetAppEnv sets the container environment variable.
+func (c *KubeTestPlatform) SetAppEnv(name, key, value string) error {
+	app := c.AppResources.FindActiveResource(name)
+	appManager := app.(*kube.AppManager)
+
+	if err := appManager.SetAppEnv(key, value); err != nil {
 		return err
 	}
 

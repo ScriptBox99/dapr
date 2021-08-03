@@ -104,6 +104,10 @@ var componentCategoriesNeedProcess = []ComponentCategory{
 
 var log = logger.NewLogger("dapr.runtime")
 
+// ErrUnexpectedEnvelopeData denotes that an unexpected data type
+// was encountered when processing a cloud event's data property.
+var ErrUnexpectedEnvelopeData = errors.New("unexpected data type encountered in envelope")
+
 type Route struct {
 	path     string
 	metadata map[string]string
@@ -155,6 +159,8 @@ type DaprRuntime struct {
 
 	pendingComponents          chan components_v1alpha1.Component
 	pendingComponentDependents map[string][]components_v1alpha1.Component
+
+	proxy messaging.Proxy
 }
 
 type componentPreprocessRes struct {
@@ -322,6 +328,10 @@ func (a *DaprRuntime) initRuntime(opts *runtimeOpts) error {
 
 	// Setup allow/deny list for secrets
 	a.populateSecretsConfiguration()
+
+	// Start proxy
+	a.initProxy()
+
 	// Create and start internal and external gRPC servers
 	grpcAPI := a.getGRPCAPI()
 
@@ -510,7 +520,18 @@ func (a *DaprRuntime) initDirectMessaging(resolver nr.Resolver) {
 		a.grpc.GetGRPCConnection,
 		resolver,
 		a.globalConfig.Spec.TracingSpec,
-		a.runtimeConfig.MaxRequestBodySize)
+		a.runtimeConfig.MaxRequestBodySize,
+		a.proxy)
+}
+
+func (a *DaprRuntime) initProxy() {
+	// TODO: remove feature check once stable
+	if config.IsFeatureEnabled(a.globalConfig.Spec.Features, messaging.GRPCFeatureName) {
+		a.proxy = messaging.NewProxy(a.grpc.GetGRPCConnection, a.runtimeConfig.ID,
+			fmt.Sprintf("%s:%d", channel.DefaultChannelAddress, a.runtimeConfig.ApplicationPort), a.runtimeConfig.InternalGRPCPort, a.accessControlList)
+
+		log.Info("gRPC proxy enabled")
+	}
 }
 
 func (a *DaprRuntime) beginComponentsUpdates() error {
@@ -521,13 +542,13 @@ func (a *DaprRuntime) beginComponentsUpdates() error {
 	go func() {
 		stream, err := a.operatorClient.ComponentUpdate(context.Background(), &emptypb.Empty{})
 		if err != nil {
-			log.Errorf("error from operator stream: %s", err)
+			log.Fatalf("error from operator stream: %s", err)
 			return
 		}
 		for {
 			c, err := stream.Recv()
 			if err != nil {
-				log.Errorf("error from operator stream: %s", err)
+				log.Fatalf("error from operator stream: %s", err)
 				return
 			}
 
@@ -598,7 +619,7 @@ func (a *DaprRuntime) sendToOutputBinding(name string, req *bindings.InvokeReque
 				return binding.Invoke(req)
 			}
 		}
-		supported := make([]string, len(ops))
+		supported := make([]string, 0, len(ops))
 		for _, o := range ops {
 			supported = append(supported, string(o))
 		}
@@ -661,7 +682,8 @@ func (a *DaprRuntime) sendBindingEventToApp(bindingName string, data []byte, met
 		}
 
 		if err != nil {
-			return nil, errors.Wrap(err, "error invoking app")
+			body := resp.Data
+			return nil, errors.Wrap(err, fmt.Sprintf("error invoking app, body: %s", string(body)))
 		}
 		if resp != nil {
 			if resp.Concurrency == runtimev1pb.BindingEventResponse_PARALLEL {
@@ -719,7 +741,8 @@ func (a *DaprRuntime) sendBindingEventToApp(bindingName string, data []byte, met
 		}
 
 		if resp.Status().Code != nethttp.StatusOK {
-			return nil, errors.Errorf("fails to send binding event to http app channel, status code: %d", resp.Status().Code)
+			_, body := resp.RawData()
+			return nil, errors.Errorf("fails to send binding event to http app channel, status code: %d body: %s", resp.Status().Code, string(body))
 		}
 
 		if resp.Message().Data != nil && len(resp.Message().Data.Value) > 0 {
@@ -767,14 +790,14 @@ func (a *DaprRuntime) startHTTPServer(port, profilePort int, allowedOrigins stri
 
 func (a *DaprRuntime) startGRPCInternalServer(api grpc.API, port int) error {
 	serverConf := a.getNewServerConfig(port)
-	server := grpc.NewInternalServer(api, serverConf, a.globalConfig.Spec.TracingSpec, a.globalConfig.Spec.MetricSpec, a.authenticator)
+	server := grpc.NewInternalServer(api, serverConf, a.globalConfig.Spec.TracingSpec, a.globalConfig.Spec.MetricSpec, a.authenticator, a.proxy)
 	err := server.StartNonBlocking()
 	return err
 }
 
 func (a *DaprRuntime) startGRPCAPIServer(api grpc.API, port int) error {
 	serverConf := a.getNewServerConfig(port)
-	server := grpc.NewAPIServer(api, serverConf, a.globalConfig.Spec.TracingSpec, a.globalConfig.Spec.MetricSpec, a.globalConfig.Spec.APISpec)
+	server := grpc.NewAPIServer(api, serverConf, a.globalConfig.Spec.TracingSpec, a.globalConfig.Spec.MetricSpec, a.globalConfig.Spec.APISpec, a.proxy)
 	err := server.StartNonBlocking()
 	return err
 }
@@ -968,9 +991,10 @@ func (a *DaprRuntime) getTopicRoutes() (map[string]TopicRoute, error) {
 		return a.topicRoutes, nil
 	}
 
-	var topicRoutes map[string]TopicRoute = make(map[string]TopicRoute)
+	topicRoutes := make(map[string]TopicRoute)
 
 	if a.appChannel == nil {
+		log.Warn("app channel not initialized, make sure -app-port is specified if pubsub subscription is required")
 		return topicRoutes, nil
 	}
 
@@ -1114,7 +1138,7 @@ func (a *DaprRuntime) isPubSubOperationAllowed(pubsubName string, topic string, 
 func (a *DaprRuntime) initNameResolution() error {
 	var resolver nr.Resolver
 	var err error
-	var resolverMetadata = nr.Metadata{}
+	resolverMetadata := nr.Metadata{}
 
 	resolverName := a.globalConfig.Spec.NameResolutionSpec.Component
 	resolverVersion := a.globalConfig.Spec.NameResolutionSpec.Version
@@ -1168,7 +1192,7 @@ func (a *DaprRuntime) publishMessageHTTP(ctx context.Context, msg *pubsubSubscri
 	cloudEvent := msg.cloudEvent
 
 	if pubsub.HasExpired(cloudEvent) {
-		log.Warnf("dropping expired pub/sub event %v as of %v", cloudEvent[pubsub.IDField].(string), cloudEvent[pubsub.ExpirationField].(string))
+		log.Warnf("dropping expired pub/sub event %v as of %v", cloudEvent[pubsub.IDField], cloudEvent[pubsub.ExpirationField])
 		return nil
 	}
 
@@ -1207,7 +1231,7 @@ func (a *DaprRuntime) publishMessageHTTP(ctx context.Context, msg *pubsubSubscri
 		var appResponse pubsub.AppResponse
 		err := a.json.Unmarshal(body, &appResponse)
 		if err != nil {
-			log.Debugf("skipping status check due to error parsing result from pub/sub event %v", cloudEvent[pubsub.IDField].(string))
+			log.Debugf("skipping status check due to error parsing result from pub/sub event %v", cloudEvent[pubsub.IDField])
 			// Return no error so message does not get reprocessed.
 			return nil
 		}
@@ -1219,73 +1243,89 @@ func (a *DaprRuntime) publishMessageHTTP(ctx context.Context, msg *pubsubSubscri
 		case pubsub.Success:
 			return nil
 		case pubsub.Retry:
-			return errors.Errorf("RETRY status returned from app while processing pub/sub event %v", cloudEvent[pubsub.IDField].(string))
+			return errors.Errorf("RETRY status returned from app while processing pub/sub event %v", cloudEvent[pubsub.IDField])
 		case pubsub.Drop:
-			log.Warnf("DROP status returned from app while processing pub/sub event %v", cloudEvent[pubsub.IDField].(string))
+			log.Warnf("DROP status returned from app while processing pub/sub event %v", cloudEvent[pubsub.IDField])
 			return nil
 		}
 		// Consider unknown status field as error and retry
-		return errors.Errorf("unknown status returned from app while processing pub/sub event %v: %v", cloudEvent[pubsub.IDField].(string), appResponse.Status)
+		return errors.Errorf("unknown status returned from app while processing pub/sub event %v: %v", cloudEvent[pubsub.IDField], appResponse.Status)
 	}
 
 	if statusCode == nethttp.StatusNotFound {
 		// These are errors that are not retriable, for now it is just 404 but more status codes can be added.
 		// When adding/removing an error here, check if that is also applicable to GRPC since there is a mapping between HTTP and GRPC errors:
 		// https://cloud.google.com/apis/design/errors#handling_errors
-		log.Errorf("non-retriable error returned from app while processing pub/sub event %v: %s. status code returned: %v", cloudEvent[pubsub.IDField].(string), body, statusCode)
+		log.Errorf("non-retriable error returned from app while processing pub/sub event %v: %s. status code returned: %v", cloudEvent[pubsub.IDField], body, statusCode)
 		return nil
 	}
 
 	// Every error from now on is a retriable error.
-	log.Warnf("retriable error returned from app while processing pub/sub event %v: %s. status code returned: %v", cloudEvent[pubsub.IDField].(string), body, statusCode)
-	return errors.Errorf("retriable error returned from app while processing pub/sub event %v: %s. status code returned: %v", cloudEvent[pubsub.IDField].(string), body, statusCode)
+	log.Warnf("retriable error returned from app while processing pub/sub event %v: %s. status code returned: %v", cloudEvent[pubsub.IDField], body, statusCode)
+	return errors.Errorf("retriable error returned from app while processing pub/sub event %v: %s. status code returned: %v", cloudEvent[pubsub.IDField], body, statusCode)
 }
 
 func (a *DaprRuntime) publishMessageGRPC(ctx context.Context, msg *pubsubSubscribedMessage) error {
 	cloudEvent := msg.cloudEvent
 
 	if pubsub.HasExpired(cloudEvent) {
-		log.Warnf("dropping expired pub/sub event %v as of %v", cloudEvent[pubsub.IDField].(string), cloudEvent[pubsub.ExpirationField].(string))
+		log.Warnf("dropping expired pub/sub event %v as of %v", cloudEvent[pubsub.IDField], cloudEvent[pubsub.ExpirationField])
+
 		return nil
 	}
 
 	envelope := &runtimev1pb.TopicEventRequest{
-		Id:              cloudEvent[pubsub.IDField].(string),
-		Source:          cloudEvent[pubsub.SourceField].(string),
-		DataContentType: cloudEvent[pubsub.DataContentTypeField].(string),
-		Type:            cloudEvent[pubsub.TypeField].(string),
-		SpecVersion:     cloudEvent[pubsub.SpecVersionField].(string),
+		Id:              extractCloudEventProperty(cloudEvent, pubsub.IDField),
+		Source:          extractCloudEventProperty(cloudEvent, pubsub.SourceField),
+		DataContentType: extractCloudEventProperty(cloudEvent, pubsub.DataContentTypeField),
+		Type:            extractCloudEventProperty(cloudEvent, pubsub.TypeField),
+		SpecVersion:     extractCloudEventProperty(cloudEvent, pubsub.SpecVersionField),
 		Topic:           msg.topic,
 		PubsubName:      msg.metadata[pubsubName],
 	}
 
 	if data, ok := cloudEvent[pubsub.DataBase64Field]; ok && data != nil {
-		decoded, decodeErr := base64.StdEncoding.DecodeString(data.(string))
-		if decodeErr != nil {
-			log.Debugf("unable to base64 decode cloudEvent field data_base64: %s", decodeErr)
-			return decodeErr
-		}
+		if dataAsString, ok := data.(string); ok {
+			decoded, decodeErr := base64.StdEncoding.DecodeString(dataAsString)
+			if decodeErr != nil {
+				log.Debugf("unable to base64 decode cloudEvent field data_base64: %s", decodeErr)
 
-		envelope.Data = decoded
+				return decodeErr
+			}
+
+			envelope.Data = decoded
+		} else {
+			return ErrUnexpectedEnvelopeData
+		}
 	} else if data, ok := cloudEvent[pubsub.DataField]; ok && data != nil {
 		envelope.Data = nil
 
 		if contenttype.IsStringContentType(envelope.DataContentType) {
-			envelope.Data = []byte(data.(string))
+			switch v := data.(type) {
+			case string:
+				envelope.Data = []byte(v)
+			case []byte:
+				envelope.Data = v
+			default:
+				return ErrUnexpectedEnvelopeData
+			}
 		} else if contenttype.IsJSONContentType(envelope.DataContentType) {
 			envelope.Data, _ = a.json.Marshal(data)
 		}
 	}
 
 	var span *trace.Span
-	if cloudEvent[pubsub.TraceIDField] != nil {
-		traceID := cloudEvent[pubsub.TraceIDField].(string)
-		sc, _ := diag.SpanContextFromW3CString(traceID)
-		spanName := fmt.Sprintf("pubsub/%s", msg.topic)
+	if iTraceID, ok := cloudEvent[pubsub.TraceIDField]; ok {
+		if traceID, ok := iTraceID.(string); ok {
+			sc, _ := diag.SpanContextFromW3CString(traceID)
+			spanName := fmt.Sprintf("pubsub/%s", msg.topic)
 
-		// no ops if trace is off
-		ctx, span = diag.StartInternalCallbackSpan(ctx, spanName, sc, a.globalConfig.Spec.TracingSpec)
-		ctx = diag.SpanContextToGRPCMetadata(ctx, span.SpanContext())
+			// no ops if trace is off
+			ctx, span = diag.StartInternalCallbackSpan(ctx, spanName, sc, a.globalConfig.Spec.TracingSpec)
+			ctx = diag.SpanContextToGRPCMetadata(ctx, span.SpanContext())
+		} else {
+			log.Warnf("ignored non-string traceid value: %v", iTraceID)
+		}
 	}
 
 	// call appcallback
@@ -1303,12 +1343,14 @@ func (a *DaprRuntime) publishMessageGRPC(ctx context.Context, msg *pubsubSubscri
 		errStatus, hasErrStatus := status.FromError(err)
 		if hasErrStatus && (errStatus.Code() == codes.Unimplemented) {
 			// DROP
-			log.Warnf("non-retriable error returned from app while processing pub/sub event %v: %s", cloudEvent[pubsub.IDField].(string), err)
+			log.Warnf("non-retriable error returned from app while processing pub/sub event %v: %s", cloudEvent[pubsub.IDField], err)
+
 			return nil
 		}
 
-		err = errors.Errorf("error returned from app while processing pub/sub event %v: %s", cloudEvent[pubsub.IDField].(string), err)
+		err = errors.Errorf("error returned from app while processing pub/sub event %v: %s", cloudEvent[pubsub.IDField], err)
 		log.Debug(err)
+
 		// on error from application, return error for redelivery of event
 		return err
 	}
@@ -1319,13 +1361,29 @@ func (a *DaprRuntime) publishMessageGRPC(ctx context.Context, msg *pubsubSubscri
 		// success from protobuf definition
 		return nil
 	case runtimev1pb.TopicEventResponse_RETRY:
-		return errors.Errorf("RETRY status returned from app while processing pub/sub event %v", cloudEvent[pubsub.IDField].(string))
+		return errors.Errorf("RETRY status returned from app while processing pub/sub event %v", cloudEvent[pubsub.IDField])
 	case runtimev1pb.TopicEventResponse_DROP:
-		log.Warnf("DROP status returned from app while processing pub/sub event %v", cloudEvent[pubsub.IDField].(string))
+		log.Warnf("DROP status returned from app while processing pub/sub event %v", cloudEvent[pubsub.IDField])
+
 		return nil
 	}
+
 	// Consider unknown status field as error and retry
-	return errors.Errorf("unknown status returned from app while processing pub/sub event %v: %v", cloudEvent[pubsub.IDField].(string), res.GetStatus())
+	return errors.Errorf("unknown status returned from app while processing pub/sub event %v: %v", cloudEvent[pubsub.IDField], res.GetStatus())
+}
+
+func extractCloudEventProperty(cloudEvent map[string]interface{}, property string) string {
+	if cloudEvent == nil {
+		return ""
+	}
+	iValue, ok := cloudEvent[property]
+	if ok {
+		if value, ok := iValue.(string); ok {
+			return value
+		}
+	}
+
+	return ""
 }
 
 func (a *DaprRuntime) initActors() error {
@@ -1334,7 +1392,8 @@ func (a *DaprRuntime) initActors() error {
 		return err
 	}
 	actorConfig := actors.NewConfig(a.hostAddress, a.runtimeConfig.ID, a.runtimeConfig.PlacementAddresses, a.appConfig.Entities,
-		a.runtimeConfig.InternalGRPCPort, a.appConfig.ActorScanInterval, a.appConfig.ActorIdleTimeout, a.appConfig.DrainOngoingCallTimeout, a.appConfig.DrainRebalancedActors, a.namespace, a.appConfig.Reentrancy)
+		a.runtimeConfig.InternalGRPCPort, a.appConfig.ActorScanInterval, a.appConfig.ActorIdleTimeout, a.appConfig.DrainOngoingCallTimeout,
+		a.appConfig.DrainRebalancedActors, a.namespace, a.appConfig.Reentrancy, a.appConfig.RemindersStoragePartitions)
 	act := actors.NewActors(a.stateStores[a.actorStateStoreName], a.appChannel, a.grpc.GetGRPCConnection, actorConfig, a.runtimeConfig.CertChain, a.globalConfig.Spec.TracingSpec, a.globalConfig.Spec.Features)
 	err = act.Init()
 	a.actor = act
@@ -1722,7 +1781,7 @@ func (a *DaprRuntime) loadAppConfiguration() {
 
 func (a *DaprRuntime) createAppChannel() error {
 	if a.runtimeConfig.ApplicationPort > 0 {
-		var channelCreatorFn func(port, maxConcurrency int, spec config.TracingSpec, sslEnabled bool) (channel.AppChannel, error)
+		var channelCreatorFn func(port, maxConcurrency int, spec config.TracingSpec, sslEnabled bool, maxRequestBodySize int) (channel.AppChannel, error)
 
 		switch a.runtimeConfig.ApplicationProtocol {
 		case GRPCProtocol:
@@ -1733,7 +1792,7 @@ func (a *DaprRuntime) createAppChannel() error {
 			return errors.Errorf("cannot create app channel for protocol %s", string(a.runtimeConfig.ApplicationProtocol))
 		}
 
-		ch, err := channelCreatorFn(a.runtimeConfig.ApplicationPort, a.runtimeConfig.MaxConcurrency, a.globalConfig.Spec.TracingSpec, a.runtimeConfig.AppSSL)
+		ch, err := channelCreatorFn(a.runtimeConfig.ApplicationPort, a.runtimeConfig.MaxConcurrency, a.globalConfig.Spec.TracingSpec, a.runtimeConfig.AppSSL, a.runtimeConfig.MaxRequestBodySize)
 		if err != nil {
 			return err
 		}
@@ -1850,6 +1909,7 @@ func (a *DaprRuntime) establishSecurity(sentryAddress string) error {
 func componentDependency(compCategory ComponentCategory, name string) string {
 	return fmt.Sprintf("%s:%s", compCategory, name)
 }
+
 func (a *DaprRuntime) startSubscribing() {
 	for name, pubsub := range a.pubSubs {
 		if err := a.beginPubSub(name, pubsub); err != nil {
