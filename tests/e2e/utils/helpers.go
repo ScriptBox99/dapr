@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package utils
 
@@ -9,7 +17,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"strings"
@@ -41,6 +48,8 @@ type StateTransactionKeyValue struct {
 	Value         string
 	OperationType string
 }
+
+var httpClient = newHTTPClient()
 
 // GenerateRandomStringKeys generates random string keys (values are nil).
 func GenerateRandomStringKeys(num int) []SimpleKeyValue {
@@ -159,11 +168,10 @@ func HTTPGetRawNTimes(url string, n int) (*http.Response, error) {
 
 // HTTPGetRaw is a helper to make GET request call to url.
 func httpGetRaw(url string, t time.Duration) (*http.Response, error) {
-	client := newHTTPClient()
 	if t != 0 {
-		client.Timeout = t
+		httpClient.Timeout = t
 	}
-	resp, err := client.Get(sanitizeHTTPURL(url))
+	resp, err := httpClient.Get(sanitizeHTTPURL(url))
 	if err != nil {
 		return nil, err
 	}
@@ -177,8 +185,7 @@ func HTTPGetRaw(url string) (*http.Response, error) {
 
 // HTTPPost is a helper to make POST request call to url.
 func HTTPPost(url string, data []byte) ([]byte, error) {
-	client := newHTTPClient()
-	resp, err := client.Post(sanitizeHTTPURL(url), "application/json", bytes.NewBuffer(data)) //nolint
+	resp, err := httpClient.Post(sanitizeHTTPURL(url), "application/json", bytes.NewBuffer(data)) //nolint
 	if err != nil {
 		return nil, err
 	}
@@ -188,8 +195,7 @@ func HTTPPost(url string, data []byte) ([]byte, error) {
 
 // HTTPPostWithStatus is a helper to make POST request call to url.
 func HTTPPostWithStatus(url string, data []byte) ([]byte, int, error) {
-	client := newHTTPClient()
-	resp, err := client.Post(sanitizeHTTPURL(url), "application/json", bytes.NewBuffer(data)) //nolint
+	resp, err := httpClient.Post(sanitizeHTTPURL(url), "application/json", bytes.NewBuffer(data)) //nolint
 	if err != nil {
 		// From the Do method for the client.Post
 		// An error is returned if caused by client policy (such as
@@ -209,14 +215,12 @@ func HTTPPostWithStatus(url string, data []byte) ([]byte, int, error) {
 
 // HTTPDelete calls a given URL with the HTTP DELETE method.
 func HTTPDelete(url string) ([]byte, error) {
-	client := newHTTPClient()
-
 	req, err := http.NewRequest("DELETE", sanitizeHTTPURL(url), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	res, err := client.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +247,7 @@ func extractBody(r io.ReadCloser) ([]byte, error) {
 		defer r.Close()
 	}
 
-	body, err := ioutil.ReadAll(r)
+	body, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}

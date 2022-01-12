@@ -3,16 +3,21 @@ package pubsub
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/ghodss/yaml"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/dapr/kit/retry"
 
 	subscriptionsapi_v1alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
 	subscriptionsapi_v2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
@@ -64,12 +69,18 @@ func GetSubscriptionsHTTP(channel channel.AppChannel, log logger.Logger) ([]Subs
 
 	// TODO Propagate Context
 	ctx := context.Background()
-	resp, err := channel.InvokeMethod(ctx, req)
-	if err != nil {
-		log.Errorf(getTopicsError, err)
 
-		return nil, err
-	}
+	var resp *invokev1.InvokeMethodResponse
+	var err error
+
+	backoff := getSubscriptionsBackoff()
+
+	retry.NotifyRecover(func() error {
+		resp, err = channel.InvokeMethod(ctx, req)
+		return err
+	}, backoff, func(err error, d time.Duration) {
+		log.Debug("failed getting gRPC subscriptions, starting retry")
+	}, func() {})
 
 	switch resp.Status().Code {
 	case http.StatusOK:
@@ -138,29 +149,55 @@ func filterSubscriptions(subscriptions []Subscription, log logger.Logger) []Subs
 	return subscriptions
 }
 
+func getSubscriptionsBackoff() backoff.BackOff {
+	config := retry.DefaultConfig()
+	config.Policy = retry.PolicyExponential
+	return config.NewBackOff()
+}
+
 func GetSubscriptionsGRPC(channel runtimev1pb.AppCallbackClient, log logger.Logger) ([]Subscription, error) {
 	var subscriptions []Subscription
 
-	resp, err := channel.ListTopicSubscriptions(context.Background(), &emptypb.Empty{})
+	var err error
+	var resp *runtimev1pb.ListTopicSubscriptionsResponse
+
+	backoff := getSubscriptionsBackoff()
+
+	retry.NotifyRecover(func() error {
+		resp, err = channel.ListTopicSubscriptions(context.Background(), &emptypb.Empty{})
+
+		if err != nil {
+			if s, ok := status.FromError(err); ok && s != nil {
+				if s.Code() == codes.Unimplemented {
+					return nil
+				}
+			}
+		}
+		return err
+	}, backoff, func(err error, d time.Duration) {
+		log.Debug("failed getting gRPC subscriptions, starting retry")
+	}, func() {})
+
 	if err != nil {
 		// Unexpected response: both GRPC and HTTP have to log the same level.
 		log.Errorf(getTopicsError, err)
+		return nil, err
+	}
+
+	if resp == nil || resp.Subscriptions == nil || len(resp.Subscriptions) == 0 {
+		log.Debug(noSubscriptionsError)
 	} else {
-		if resp == nil || resp.Subscriptions == nil || len(resp.Subscriptions) == 0 {
-			log.Debug(noSubscriptionsError)
-		} else {
-			for _, s := range resp.Subscriptions {
-				rules, err := parseRoutingRulesGRPC(s.Routes)
-				if err != nil {
-					return nil, err
-				}
-				subscriptions = append(subscriptions, Subscription{
-					PubsubName: s.PubsubName,
-					Topic:      s.GetTopic(),
-					Metadata:   s.GetMetadata(),
-					Rules:      rules,
-				})
+		for _, s := range resp.Subscriptions {
+			rules, err := parseRoutingRulesGRPC(s.Routes)
+			if err != nil {
+				return nil, err
 			}
+			subscriptions = append(subscriptions, Subscription{
+				PubsubName: s.PubsubName,
+				Topic:      s.GetTopic(),
+				Metadata:   s.GetMetadata(),
+				Rules:      rules,
+			})
 		}
 	}
 
@@ -175,7 +212,7 @@ func DeclarativeSelfHosted(componentsPath string, log logger.Logger) []Subscript
 		return subs
 	}
 
-	files, err := ioutil.ReadDir(componentsPath)
+	files, err := os.ReadDir(componentsPath)
 	if err != nil {
 		log.Errorf("failed to read subscriptions from path %s: %s", err)
 		return subs
@@ -184,7 +221,7 @@ func DeclarativeSelfHosted(componentsPath string, log logger.Logger) []Subscript
 	for _, f := range files {
 		if !f.IsDir() {
 			filePath := filepath.Join(componentsPath, f.Name())
-			b, err := ioutil.ReadFile(filePath)
+			b, err := os.ReadFile(filePath)
 			if err != nil {
 				log.Errorf("failed to read file %s: %s", filePath, err)
 				continue

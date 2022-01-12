@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package runtime
 
@@ -11,9 +19,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"strconv"
@@ -205,7 +214,7 @@ func testDeclarativeSubscription() subscriptionsapi.Subscription {
 
 func writeSubscriptionToDisk(subscription subscriptionsapi.Subscription, filePath string) {
 	b, _ := yaml.Marshal(subscription)
-	ioutil.WriteFile(filePath, b, 0600)
+	os.WriteFile(filePath, b, 0600)
 }
 
 func TestProcessComponentsAndDependents(t *testing.T) {
@@ -1912,6 +1921,7 @@ func TestErrorPublishedNonCloudEventHTTP(t *testing.T) {
 	fakeReq := invokev1.NewInvokeMethodRequest(testPubSubMessage.topic)
 	fakeReq.WithHTTPExtension(http.MethodPost, "")
 	fakeReq.WithRawData(testPubSubMessage.data, contenttype.CloudEventContentType)
+	fakeReq.WithCustomHTTPMetadata(testPubSubMessage.metadata)
 
 	rt := NewTestDaprRuntime(modes.StandaloneMode)
 	defer stopRuntime(t, rt)
@@ -2093,7 +2103,8 @@ func TestErrorPublishedNonCloudEventGRPC(t *testing.T) {
 func TestOnNewPublishedMessage(t *testing.T) {
 	topic := "topic1"
 
-	envelope := pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "", []byte("Test Message"), "")
+	envelope := pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic,
+		TestSecondPubsubName, "", []byte("Test Message"), "", "")
 	b, err := json.Marshal(envelope)
 	assert.Nil(t, err)
 
@@ -2108,6 +2119,7 @@ func TestOnNewPublishedMessage(t *testing.T) {
 	fakeReq := invokev1.NewInvokeMethodRequest(testPubSubMessage.topic)
 	fakeReq.WithHTTPExtension(http.MethodPost, "")
 	fakeReq.WithRawData(testPubSubMessage.data, contenttype.CloudEventContentType)
+	fakeReq.WithCustomHTTPMetadata(testPubSubMessage.metadata)
 
 	rt := NewTestDaprRuntime(modes.StandaloneMode)
 	defer stopRuntime(t, rt)
@@ -2141,7 +2153,8 @@ func TestOnNewPublishedMessage(t *testing.T) {
 
 		// Generate a new envelope to avoid affecting other tests by modifying shared `envelope`
 		envelopeNoTraceID := pubsub.NewCloudEventsEnvelope(
-			"", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "", []byte("Test Message"), "")
+			"", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "",
+			[]byte("Test Message"), "", "")
 		delete(envelopeNoTraceID, pubsub.TraceIDField)
 		bNoTraceID, err := json.Marshal(envelopeNoTraceID)
 		assert.Nil(t, err)
@@ -2157,6 +2170,7 @@ func TestOnNewPublishedMessage(t *testing.T) {
 		fakeReqNoTraceID := invokev1.NewInvokeMethodRequest(message.topic)
 		fakeReqNoTraceID.WithHTTPExtension(http.MethodPost, "")
 		fakeReqNoTraceID.WithRawData(message.data, contenttype.CloudEventContentType)
+		fakeReqNoTraceID.WithCustomHTTPMetadata(testPubSubMessage.metadata)
 		mockAppChannel.On("InvokeMethod", mock.AnythingOfType("*context.emptyCtx"), fakeReqNoTraceID).Return(fakeResp, nil)
 
 		// act
@@ -2357,7 +2371,8 @@ func TestOnNewPublishedMessage(t *testing.T) {
 func TestOnNewPublishedMessageGRPC(t *testing.T) {
 	topic := "topic1"
 
-	envelope := pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "", []byte("Test Message"), "")
+	envelope := pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic,
+		TestSecondPubsubName, "", []byte("Test Message"), "", "")
 	b, err := json.Marshal(envelope)
 	assert.Nil(t, err)
 
@@ -2369,7 +2384,8 @@ func TestOnNewPublishedMessageGRPC(t *testing.T) {
 		path:       "topic1",
 	}
 
-	envelope = pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic, TestSecondPubsubName, "application/octet-stream", []byte{0x1}, "")
+	envelope = pubsub.NewCloudEventsEnvelope("", "", pubsub.DefaultCloudEventType, "", topic,
+		TestSecondPubsubName, "application/octet-stream", []byte{0x1}, "", "")
 	base64, err := json.Marshal(envelope)
 	assert.Nil(t, err)
 
@@ -2624,9 +2640,19 @@ func NewTestDaprRuntimeWithProtocol(mode modes.DaprMode, protocol string, appPor
 		-1,
 		false,
 		"",
-		false, 4, "")
+		false,
+		4,
+		"",
+		4,
+		false,
+		time.Second)
 
 	return NewDaprRuntime(testRuntimeConfig, &config.Configuration{}, &config.AccessControlList{})
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	r := NewTestDaprRuntime(modes.StandaloneMode)
+	assert.Equal(t, time.Second, r.runtimeConfig.GracefulShutdownDuration)
 }
 
 func TestMTLS(t *testing.T) {
@@ -2639,7 +2665,11 @@ func TestMTLS(t *testing.T) {
 		os.Setenv(certs.TrustAnchorsEnvVar, testCertRoot)
 		os.Setenv(certs.CertChainEnvVar, "a")
 		os.Setenv(certs.CertKeyEnvVar, "b")
-		defer os.Clearenv()
+		defer func() {
+			os.Unsetenv(certs.TrustAnchorsEnvVar)
+			os.Unsetenv(certs.CertChainEnvVar)
+			os.Unsetenv(certs.CertKeyEnvVar)
+		}()
 
 		certChain, err := security.GetCertChain()
 		assert.Nil(t, err)
@@ -2860,7 +2890,7 @@ func TestNamespace(t *testing.T) {
 
 	t.Run("non-empty namespace", func(t *testing.T) {
 		os.Setenv("NAMESPACE", "a")
-		defer os.Clearenv()
+		defer os.Unsetenv("NAMESPACE")
 
 		rt := NewTestDaprRuntime(modes.StandaloneMode)
 		defer stopRuntime(t, rt)
@@ -3394,4 +3424,34 @@ func createRoutingRule(match, path string) (*runtime_pubsub.Rule, error) {
 		Match: e,
 		Path:  path,
 	}, nil
+}
+
+func TestComponentsCallback(t *testing.T) {
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "OK")
+	}))
+	defer svr.Close()
+
+	u, err := url.Parse(svr.URL)
+	require.NoError(t, err)
+	port, _ := strconv.Atoi(u.Port())
+	rt := NewTestDaprRuntimeWithProtocol(modes.StandaloneMode, "http", port)
+	defer stopRuntime(t, rt)
+
+	c := make(chan struct{})
+	callbackInvoked := false
+
+	rt.Run(WithComponentsCallback(func(components ComponentRegistry) error {
+		close(c)
+		callbackInvoked = true
+
+		return nil
+	}))
+
+	select {
+	case <-c:
+	case <-time.After(10 * time.Second):
+	}
+
+	assert.True(t, callbackInvoked, "component callback was not invoked")
 }

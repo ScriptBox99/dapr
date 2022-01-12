@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package placement
 
@@ -14,6 +22,8 @@ import (
 	"github.com/dapr/dapr/pkg/placement/monitoring"
 	"github.com/dapr/dapr/pkg/placement/raft"
 	v1pb "github.com/dapr/dapr/pkg/proto/placement/v1"
+
+	"github.com/dapr/kit/retry"
 )
 
 const (
@@ -310,19 +320,28 @@ func (p *Service) disseminateOperation(targets []placementGRPCStream, operation 
 
 	var err error
 	for _, s := range targets {
-		err = s.Send(o)
+		config := retry.DefaultConfig()
+		config.MaxRetries = 3
+		backoff := config.NewBackOff()
 
-		if err != nil {
-			remoteAddr := "n/a"
-			if peer, ok := peer.FromContext(s.Context()); ok {
-				remoteAddr = peer.Addr.String()
-			}
+		retry.NotifyRecover(
+			func() error {
+				err = s.Send(o)
 
-			log.Errorf("error updating runtime host (%q) on %q operation: %s", remoteAddr, operation, err)
-			// TODO: the error should not be ignored. By handing error or retrying dissemination,
-			// this logic needs to be improved. Otherwise, the runtimes throwing the exception
-			// will have the inconsistent hashing tables.
-		}
+				if err != nil {
+					remoteAddr := "n/a"
+					if peer, ok := peer.FromContext(s.Context()); ok {
+						remoteAddr = peer.Addr.String()
+					}
+
+					log.Errorf("error updating runtime host (%q) on %q operation: %s", remoteAddr, operation, err)
+					return err
+				}
+				return nil
+			},
+			backoff,
+			func(err error, d time.Duration) { log.Debugf("Attempting to disseminate again after error: %v", err) },
+			func() { log.Debug("Dissemination successful.") })
 	}
 
 	return err

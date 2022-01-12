@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 //nolint:goconst
 package http
@@ -11,7 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	gohttp "net/http"
 	"os"
@@ -855,7 +863,7 @@ func TestV1ActorEndpoints(t *testing.T) {
 		apisAndMethods := map[string][]string{
 			"v1.0/actors/fakeActorType/fakeActorID/state/key1":          {"GET"},
 			"v1.0/actors/fakeActorType/fakeActorID/state":               {"POST", "PUT"},
-			"v1.0/actors/fakeActorType/fakeActorID/reminders/reminder1": {"POST", "PUT", "GET", "DELETE"},
+			"v1.0/actors/fakeActorType/fakeActorID/reminders/reminder1": {"POST", "PUT", "GET", "DELETE", "PATCH"},
 			"v1.0/actors/fakeActorType/fakeActorID/method/method1":      {"POST", "PUT", "GET", "DELETE"},
 			"v1.0/actors/fakeActorType/fakeActorID/timers/timer1":       {"POST", "PUT", "DELETE"},
 		}
@@ -893,6 +901,24 @@ func TestV1ActorEndpoints(t *testing.T) {
 				assert.Equal(t, 400, resp.StatusCode, apiPath)
 				assert.Equal(t, "ERR_MALFORMED_REQUEST", resp.ErrorBody["errorCode"])
 			}
+		}
+	})
+
+	t.Run("All PATCH APIs - 400 for invalid JSON", func(t *testing.T) {
+		testAPI.actor = new(daprt.MockActors)
+		apiPaths := []string{
+			"v1.0/actors/fakeActorType/fakeActorID/reminders/reminder1",
+		}
+
+		for _, apiPath := range apiPaths {
+			inputBodyBytes := invalidJSON
+
+			// act
+			resp := fakeServer.DoRequest(fasthttp.MethodPatch, apiPath, inputBodyBytes, nil)
+
+			// assert
+			assert.Equal(t, 400, resp.StatusCode, apiPath)
+			assert.Equal(t, "ERR_MALFORMED_REQUEST", resp.ErrorBody["errorCode"])
 		}
 	})
 
@@ -1188,6 +1214,59 @@ func TestV1ActorEndpoints(t *testing.T) {
 		assert.Equal(t, 500, resp.StatusCode)
 		assert.Equal(t, "ERR_ACTOR_REMINDER_CREATE", resp.ErrorBody["errorCode"])
 		mockActors.AssertNumberOfCalls(t, "CreateReminder", 1)
+	})
+
+	t.Run("Reminder Rename - 204 when RenameReminderFails", func(t *testing.T) {
+		apiPath := "v1.0/actors/fakeActorType/fakeActorID/reminders/reminder1"
+
+		reminderRequest := actors.RenameReminderRequest{
+			OldName:   "reminder1",
+			ActorType: "fakeActorType",
+			ActorID:   "fakeActorID",
+			NewName:   "reminder2",
+		}
+		mockActors := new(daprt.MockActors)
+
+		mockActors.On("RenameReminder", &reminderRequest).Return(nil)
+
+		testAPI.actor = mockActors
+
+		// act
+		inputBodyBytes, err := json.Marshal(reminderRequest)
+
+		assert.NoError(t, err)
+		resp := fakeServer.DoRequest("PATCH", apiPath, inputBodyBytes, nil)
+
+		// assert
+		assert.Equal(t, 204, resp.StatusCode)
+		mockActors.AssertNumberOfCalls(t, "RenameReminder", 1)
+	})
+
+	t.Run("Reminder Rename - 500 when RenameReminderFails", func(t *testing.T) {
+		apiPath := "v1.0/actors/fakeActorType/fakeActorID/reminders/reminder1"
+
+		reminderRequest := actors.RenameReminderRequest{
+			OldName:   "reminder1",
+			ActorType: "fakeActorType",
+			ActorID:   "fakeActorID",
+			NewName:   "reminder2",
+		}
+		mockActors := new(daprt.MockActors)
+
+		mockActors.On("RenameReminder", &reminderRequest).Return(errors.New("UPSTREAM_ERROR"))
+
+		testAPI.actor = mockActors
+
+		// act
+		inputBodyBytes, err := json.Marshal(reminderRequest)
+
+		assert.NoError(t, err)
+		resp := fakeServer.DoRequest("PATCH", apiPath, inputBodyBytes, nil)
+
+		// assert
+		assert.Equal(t, 500, resp.StatusCode)
+		assert.Equal(t, "ERR_ACTOR_REMINDER_RENAME", resp.ErrorBody["errorCode"])
+		mockActors.AssertNumberOfCalls(t, "RenameReminder", 1)
 	})
 
 	t.Run("Reminder Delete - 204 No Content", func(t *testing.T) {
@@ -1678,7 +1757,7 @@ func TestAPIToken(t *testing.T) {
 	token := "1234"
 
 	os.Setenv("DAPR_API_TOKEN", token)
-	defer os.Clearenv()
+	defer os.Unsetenv("DAPR_API_TOKEN")
 
 	fakeHeaderMetadata := map[string][]string{
 		"Accept-Encoding": {"gzip"},
@@ -1874,14 +1953,14 @@ func TestEmptyPipelineWithTracer(t *testing.T) {
 
 func buildHTTPPineline(spec config.PipelineSpec) http_middleware.Pipeline {
 	registry := http_middleware_loader.NewRegistry()
-	registry.Register(http_middleware_loader.New("uppercase", func(metadata middleware.Metadata) http_middleware.Middleware {
+	registry.Register(http_middleware_loader.New("uppercase", func(metadata middleware.Metadata) (http_middleware.Middleware, error) {
 		return func(h fasthttp.RequestHandler) fasthttp.RequestHandler {
 			return func(ctx *fasthttp.RequestCtx) {
 				body := string(ctx.PostBody())
 				ctx.Request.SetBody([]byte(strings.ToUpper(body)))
 				h(ctx)
 			}
-		}
+		}, nil
 	}))
 	var handlers []http_middleware.Middleware
 	for i := 0; i < len(spec.Handlers); i++ {
@@ -2185,7 +2264,7 @@ func (f *fakeHTTPServer) doRequest(basicAuth, method, path string, body []byte, 
 		panic(fmt.Errorf("failed to request: %v", err))
 	}
 
-	bodyBytes, _ := ioutil.ReadAll(res.Body)
+	bodyBytes, _ := io.ReadAll(res.Body)
 	defer res.Body.Close()
 	response := fakeHTTPResponse{
 		StatusCode:  res.StatusCode,
@@ -2212,7 +2291,7 @@ func (f *fakeHTTPServer) DoRequest(method, path string, body []byte, params map[
 func TestV1StateEndpoints(t *testing.T) {
 	etag := "`~!@#$%^&*()_+-={}[]|\\:\";'<>?,./'"
 	fakeServer := newFakeHTTPServer()
-	var fakeStore state.Store = fakeStateStore{}
+	var fakeStore state.Store = fakeStateStoreQuerier{}
 	fakeStores := map[string]state.Store{
 		"store1": fakeStore,
 	}
@@ -2229,10 +2308,11 @@ func TestV1StateEndpoints(t *testing.T) {
 
 	t.Run("Get state - 400 ERR_STATE_STORE_NOT_FOUND or NOT_CONFIGURED", func(t *testing.T) {
 		apisAndMethods := map[string][]string{
-			"v1.0/state/nonexistantStore/bad-key":     {"GET", "DELETE"},
-			"v1.0/state/nonexistantStore/":            {"POST", "PUT"},
-			"v1.0/state/nonexistantStore/bulk":        {"POST", "PUT"},
-			"v1.0/state/nonexistantStore/transaction": {"POST", "PUT"},
+			"v1.0/state/nonexistantStore/bad-key":      {"GET", "DELETE"},
+			"v1.0/state/nonexistantStore/":             {"POST", "PUT"},
+			"v1.0/state/nonexistantStore/bulk":         {"POST", "PUT"},
+			"v1.0/state/nonexistantStore/transaction":  {"POST", "PUT"},
+			"v1.0-alpha1/state/nonexistantStore/query": {"POST", "PUT"},
 		}
 
 		for apiPath, testMethods := range apisAndMethods {
@@ -2258,6 +2338,7 @@ func TestV1StateEndpoints(t *testing.T) {
 			"v1.0/state/store1/",
 			"v1.0/state/store1/bulk",
 			"v1.0/state/store1/transaction",
+			"v1.0-alpha1/state/store1/query",
 		}
 
 		for _, apiPath := range apiPaths {
@@ -2485,7 +2566,87 @@ func TestV1StateEndpoints(t *testing.T) {
 
 		assert.Equal(t, expectedResponses, responses, "Responses do not match")
 	})
+
+	t.Run("Query state request", func(t *testing.T) {
+		apiPath := fmt.Sprintf("v1.0-alpha1/state/%s/query", storeName)
+		// act
+		resp := fakeServer.DoRequest("PUT", apiPath, []byte(queryTestRequestOK), nil)
+		// assert
+		assert.Equal(t, 200, resp.StatusCode)
+		// act
+		resp = fakeServer.DoRequest("POST", apiPath, []byte(queryTestRequestOK), nil)
+		// assert
+		assert.Equal(t, 200, resp.StatusCode)
+		// act
+		resp = fakeServer.DoRequest("POST", apiPath, []byte(queryTestRequestNoRes), nil)
+		// assert
+		assert.Equal(t, 204, resp.StatusCode)
+		// act
+		resp = fakeServer.DoRequest("POST", apiPath, []byte(queryTestRequestErr), nil)
+		// assert
+		assert.Equal(t, 500, resp.StatusCode)
+		// act
+		resp = fakeServer.DoRequest("POST", apiPath, []byte(queryTestRequestSyntaxErr), nil)
+		// assert
+		assert.Equal(t, 400, resp.StatusCode)
+	})
 }
+
+func TestStateStoreQuerierNotImplemented(t *testing.T) {
+	fakeServer := newFakeHTTPServer()
+	testAPI := &api{
+		stateStores: map[string]state.Store{"store1": fakeStateStore{}},
+	}
+	fakeServer.StartServer(testAPI.constructStateEndpoints())
+
+	resp := fakeServer.DoRequest("POST", "v1.0-alpha1/state/store1/query", nil, nil)
+	// assert
+	assert.Equal(t, 404, resp.StatusCode)
+	assert.Equal(t, "ERR_METHOD_NOT_FOUND", resp.ErrorBody["errorCode"])
+}
+
+func TestStateStoreQuerierNotEnabled(t *testing.T) {
+	fakeServer := newFakeHTTPServer()
+	testAPI := &api{
+		stateStores: map[string]state.Store{"store1": fakeStateStoreQuerier{}},
+	}
+	fakeServer.StartServer(testAPI.constructStateEndpoints())
+
+	resp := fakeServer.DoRequest("POST", "v1.0/state/store1/query", nil, nil)
+	// assert
+	assert.Equal(t, 405, resp.StatusCode)
+}
+
+const (
+	queryTestRequestOK = `{
+	"filter": {
+		"EQ": { "a": "b" }
+	},
+	"sort": [
+		{ "key": "a" }
+	],
+	"page": {
+		"limit": 2
+	}
+}`
+	queryTestRequestNoRes = `{
+	"filter": {
+		"EQ": { "a": "b" }
+	},
+	"page": {
+		"limit": 2
+	}
+}`
+	queryTestRequestErr = `{
+	"filter": {
+		"EQ": { "a": "b" }
+	},
+	"sort": [
+		{ "key": "a" }
+	]
+}`
+	queryTestRequestSyntaxErr = `syntax error`
+)
 
 type fakeStateStore struct {
 	counter int
@@ -2574,6 +2735,30 @@ func (c fakeStateStore) Multi(request *state.TransactionalStateRequest) error {
 		return errors.New("Transaction error")
 	}
 	return nil
+}
+
+type fakeStateStoreQuerier struct {
+	fakeStateStore
+}
+
+func (c fakeStateStoreQuerier) Query(req *state.QueryRequest) (*state.QueryResponse, error) {
+	// simulate empty data
+	if req.Query.Sort == nil {
+		return &state.QueryResponse{}, nil
+	}
+	// simulate error
+	if req.Query.Page.Limit == 0 {
+		return nil, errors.New("Query error")
+	}
+	// simulate full result
+	return &state.QueryResponse{
+		Results: []state.QueryItem{
+			{
+				Key:  "1",
+				Data: []byte(`{"a":"b"}`),
+			},
+		},
+	}, nil
 }
 
 func TestV1SecretEndpoints(t *testing.T) {
@@ -2745,7 +2930,7 @@ func TestV1HealthzEndpoint(t *testing.T) {
 
 func TestV1TransactionEndpoints(t *testing.T) {
 	fakeServer := newFakeHTTPServer()
-	var fakeStore state.Store = fakeStateStore{}
+	var fakeStore state.Store = fakeStateStoreQuerier{}
 	fakeStoreNonTransactional := new(daprt.MockStateStore)
 	fakeStores := map[string]state.Store{
 		"store1":                fakeStore,
